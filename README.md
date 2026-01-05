@@ -53,14 +53,11 @@ Product {
 Товары могут быть сгруппированы в иерархические категории:
 
 * Напитки
-
   * Кофе
-
     * Классический
     * Авторский
   * Чай
 * Снеки
-
   * Выпечка
   * Батончики
 
@@ -96,37 +93,47 @@ RawMaterial {
 
 ---
 
-### 2.4. Цены закупки сырья (RawMaterialPrice)
+### 2.4. Цены (PriceRecord) — обобщённая сущность
 
-Цены на сырьё хранятся **во времени**.
+Цены на сырьё, закупочные цены на перепродаваемые товары и цены продажи хранятся в **единой, версионированной во времени** структуре.
 
 ```ts
-RawMaterialPrice {
-  rawMaterialId
+PriceRecord {
+  id
+  entityType: 'RAW_MATERIAL' | 'RESALE_PRODUCT' | 'SALE_PRODUCT'
+  entityId     // Ссылается на RawMaterial.id или Product.id
   price
-  unit        // совпадает с baseUnit
-  validFrom
+  currency
+  unit        // g, ml, pcs — для RAW_MATERIAL и RESALE_PRODUCT
+  validFrom   // Дата начала действия цены
+  metadata    // Доп. данные (например, pricingModel для SALE_PRODUCT)
 }
 ```
 
-Это обеспечивает:
+**Как это работает**:
+* **Сырьё (`RAW_MATERIAL`)**: `entityId` ссылается на `RawMaterial`, `unit` совпадает с его `baseUnit`.
+* **Закупка товара (`RESALE_PRODUCT`)**: `entityId` ссылается на `Product` типа `resale`, `unit` почти всегда `pcs`.
+* **Цена продажи (`SALE_PRODUCT`)**: `entityId` ссылается на `Product`, `metadata` содержит модель ценообразования (например, `{ pricingModel: 'markup', markupPercent: 100 }`).
 
-* корректный пересчёт себестоимости;
-* воспроизводимость исторических расчётов.
+**Преимущества**:
+* Унифицированная логика поиска актуальной цены на любую дату.
+* Упрощение кода и схемы базы данных.
+* Лёгкое добавление новых типов цен в будущем.
 
 ---
 
 ### 2.5. Технологические карты (TechCard)
 
-**TechCard** описывает способ производства товара типа `manufactured`.
+**TechCard** описывает способ производства товара типа `manufactured`. Существует в строгой связи 1:1 с таким товаром.
 
 ```ts
 TechCard {
   id
-  productId
+  productId   // Уникальная ссылка на Product (type: 'manufactured')
   outputQuantity
   outputUnit     // ml | g | pcs
-  version
+  version        // Для отслеживания изменений рецептуры
+  ingredients    // Связь имеет_many с TechCardIngredient
 }
 ```
 
@@ -134,80 +141,97 @@ TechCard {
 
 ### 2.6. Состав техкарты (TechCardIngredient)
 
-Связь между техкартой и используемым сырьём.
+Связь между техкартой и используемым сырьём. Хранит нормы расхода.
 
 ```ts
 TechCardIngredient {
+  id
   techCardId
   rawMaterialId
-  quantity
-  unit
-  wasteFactor?
+  quantity      // Количество на одну единицу выходного продукта
+  unit          // Должен быть конвертируем в baseUnit сырья
+  wasteFactor?  // Коэффициент потерь/усушки, например 1.1 (10% потерь)
 }
 ```
 
 ---
 
-### 2.7. Закупка перепродаваемых товаров (PurchaseItem)
+### 2.7. Расчёт себестоимости (CostCalculation)
 
-Для товаров типа `resale` хранится цена закупки.
-
-```ts
-PurchaseItem {
-  productId
-  price
-  unit        // pcs
-  validFrom
-}
-```
-
----
-
-### 2.8. Расчёт себестоимости (CostCalculation)
-
-Результат расчёта себестоимости товара на конкретный момент времени.
+Результат расчёта себестоимости товара на конкретный момент времени. Всегда фиксируется (не меняется при изменении цен в будущем).
 
 ```ts
 CostCalculation {
   id
   productId
-  calculatedAt
+  calculatedAt   // Момент времени, на который сделан расчёт
   totalCost
-  breakdown      // детализация расчёта (JSON)
-  source         // 'ingredients' | 'purchase'
+  breakdown      // JSON: детализация по ингредиентам или ссылка на закупку
+  source         // 'TECH_CARD' | 'PURCHASE_PRICE'
 }
 ```
 
-Логика:
-
-* `manufactured` → расчёт по техкарте и ценам сырья;
-* `resale` → себестоимость = цена закупки.
-
----
-
-### 2.9. Цена продажи (SalePrice)
-
-Цена продажи товара с привязкой к себестоимости и модели ценообразования.
-
-```ts
-SalePrice {
-  productId
-  price
-  currency
-  pricingModel   // fixed | markup | margin
-  baseCostId
-  validFrom
-}
-```
+**Логика формирования**:
+* Для `manufactured` товаров (`source: 'TECH_CARD'`): `breakdown` содержит массив расчётов по каждому ингредиенту техкарты, с указанием `rawMaterialId`, `quantity`, `usedPrice` (цена на дату `calculatedAt`).
+* Для `resale` товаров (`source: 'PURCHASE_PRICE'`): `breakdown` содержит ссылку на `PriceRecord.id` (тип `RESALE_PRODUCT`), который использовался как себестоимость.
 
 ---
 
-## 3. Расчёт себестоимости (инварианты)
+### 2.8. Ключевые сценарии использования
 
-* Себестоимость рассчитывается **на дату расчёта**
-* Используются цены, действующие на эту дату
-* Потери (`wasteFactor`) применяются мультипликативно
-* Результат фиксируется и не меняется при изменении цен в будущем
+#### Сценарий 1: Ввод нового сезонного напитка
+1.  **Создание товара**: В системе создаётся `Product` с типом `manufactured` (например, "Тыквенный латте").
+2.  **Создание техкарты**: Создаётся `TechCard`, привязанная к товару. В неё добавляются `TechCardIngredient` (кофе, молоко, сироп тыквенный).
+3.  **Расчёт себестоимости**: Система по запросу создаёт `CostCalculation`:
+    *   Для каждого ингредиента ищется актуальная на текущую дату цена (`PriceRecord` с `entityType: 'RAW_MATERIAL'`).
+    *   Рассчитывается стоимость с учётом `wasteFactor`.
+    *   Результат фиксируется.
+4.  **Установка цены продажи**: Менеджер создаёт `PriceRecord` с `entityType: 'SALE_PRODUCT'`, указывая модель наценки (`markup`) или фиксированную цену.
+
+#### Сценарий 2: Подорожала ваниль
+1.  **Ввод новой цены**: Бухгалтер создаёт новый `PriceRecord` для `RawMaterial` "Сироп ванильный" с `validFrom = сегодня`.
+2.  **Анализ влияния**: Система может выполнить **проверочный расчёт** для всех `TechCard`, где используется этот сироп, и показать, как изменится их себестоимость.
+3.  **Массовый пересчёт**: По решению пользователя для всех зависимых `manufactured` товаров создаются новые `CostCalculation` с актуальной датой.
+4.  **Переоценка**: На основе новых себестоимостей можно скорректировать `PriceRecord` типа `SALE_PRODUCT`.
+
+#### Сценарий 3: Работа в цеху без сети (офлайн)
+1.  **Локальные действия**: Технолог открывает PWA на планшете, видит все данные из локальной БД (RxDB). Может создавать новые `Product` и `TechCard`. Изменения помечаются статусом `pending`.
+2.  **Списание сырья**: При производстве партии фиксируется списание. Данные также сохраняются локально.
+3.  **Восстановление связи**: При подключении к Wi-Fi Service Worker инициирует синхронизацию.
+4.  **Синхронизация**: Все локальные изменения (`pending`) отправляются на сервер (`push`), затем загружаются изменения с сервера (`pull`). Пользователь получает уведомление об успехе или запрос на разрешение конфликтов.
+
+---
+
+## 3. Алгоритм расчёта себестоимости (детализация)
+
+### 3.1. Для производимых товаров (`manufactured`)
+
+**Входные данные**: `Product.id`, `calculationDate` (по умолчанию — текущая дата).
+
+**Шаги**:
+1.  Найти активную `TechCard`, связанную с товаром.
+2.  Для каждого `TechCardIngredient` в составе техкарты:
+    *   Найти `RawMaterial` по `rawMaterialId`.
+    *   Найти актуальную **цену сырья**: `PriceRecord` где `entityType = 'RAW_MATERIAL'`, `entityId = rawMaterial.id`, и `validFrom` — максимальная дата, не превышающая `calculationDate`.
+    *   Привести `quantity` к `baseUnit` сырья, если единицы измерения (`unit`) различаются.
+    *   **Стоимость ингредиента** = `quantity * price * (wasteFactor || 1.0)`.
+3.  **Итоговая себестоимость** (`totalCost`) = Сумма стоимостей всех ингредиентов.
+4.  Создать запись `CostCalculation`:
+    *   `productId` = ID товара.
+    *   `source` = `'TECH_CARD'`.
+    *   `breakdown` = JSON-массив с деталями по каждому ингредиенту (ID сырья, цена, итоговая стоимость).
+    *   `calculatedAt` = `calculationDate`.
+
+### 3.2. Для перепродаваемых товаров (`resale`)
+
+**Шаги**:
+1.  Найти актуальную **закупочную цену**: `PriceRecord` где `entityType = 'RESALE_PRODUCT'`, `entityId = product.id`, и `validFrom` — максимальная дата, не превышающая `calculationDate`.
+2.  **Себестоимость** (`totalCost`) = `price` из записи.
+3.  Создать запись `CostCalculation`:
+    *   `source` = `'PURCHASE_PRICE'`.
+    *   `breakdown` = `{ purchasePriceRecordId: priceRecord.id }`.
+
+**Инвариант**: Рассчитанная себестоимость фиксируется и не меняется при изменении цен в будущем. Это гарантирует воспроизводимость финансовой отчётности.
 
 ---
 
@@ -226,17 +250,48 @@ SalePrice {
 └─────────────────┘                      └─────────────────┘
 ```
 
-### 4.2. Синхронизация данных (офлайн/онлайн)
-- **Локальное хранилище**: RxDB с плагинами репликации
-- **Стратегия синхронизации**: Оптимистичные обновления + конфликт-разрешение
-- **Очередь запросов**: Автоматическое помещение в очередь при офлайн-режиме
-- **Фоновая синхронизация**: При появлении соединения через Service Worker
+---
+
+## 5. Синхронизация и офлайн‑режим (детали реализации)
+
+### 5.1. Модель данных на клиенте (RxDB)
+
+Каждая локальная запись в RxDB дополняется служебными полями для синхронизации:
+
+```ts
+LocalRecord {
+  // Стандартные поля сущности (id, name, price...)
+  _id: string;           // Локальный уникальный ID (например, UUID)
+  serverId?: string;     // ID, присвоенный на сервере после синхронизации
+  syncStatus: 'synced' | 'pending' | 'error';
+  lastModified: number;  // Локальная метка времени изменения
+  _deleted?: boolean;    // Флаг мягкого удаления для синхронизации
+}
+```
+
+### 5.2. Алгоритм синхронизации
+
+1.  **Инициализация**: При запуске PWA проверяется соединение. Загружается `serverId` для всех локально созданных записей.
+2.  **Локальная работа**: Все изменения создают/обновляют записи со статусом `pending`.
+3.  **Фоновая синхронизация** (при появлении сети):
+    *   **Push**: Отправляются на сервер все записи со статусом `pending`. Для каждой успешной операции локальная запись обновляется: `syncStatus = 'synced'`, `serverId` заполняется.
+    *   **Pull**: Клиент запрашивает изменения с сервера с момента последней успешной синхронизации. Полученные записи сохраняются или обновляются в локальной БД.
+4.  **Разрешение конфликтов**: При обнаружении конфликта (одна и та же запись изменена и на сервере, и офлайн) применяется стратегия **"last-write-wins"** на основе метки времени `lastModified`. Пользователь получает уведомление о конфликте для ключевых сущностей (опционально).
+5.  **Подтверждение**: UI обновляется, отображая актуальные данные. Статус-индикатор показывает, что синхронизация завершена.
+
+### 5.3. API эндпоинты для синхронизации
+
+```
+POST   /api/sync/push     - Приём пачки изменений { updates: [...], deleted: [...] }
+POST   /api/sync/pull     - Отдача изменений с меткой времени { since: timestamp }
+GET    /api/sync/status   - Статус и время последней синхронизации
+```
 
 ---
 
-## 5. Технологический стек
+## 6. Технологический стек
 
-### 5.1. Backend (API Сервер)
+### 6.1. Backend (API Сервер)
 - **Язык**: TypeScript 5.x
 - **Фреймворк**: NestJS 10.x
 - **База данных**: PostgreSQL 15+ с расширением JSONB
@@ -246,7 +301,7 @@ SalePrice {
 - **Документация API**: @nestjs/swagger (OpenAPI 3)
 - **Контейнеризация**: Docker, Docker Compose
 
-### 5.2. Frontend (PWA Клиент)
+### 6.2. Frontend (PWA Клиент)
 - **Фреймворк**: Vue 3 (Composition API) с TypeScript
 - **UI-Фреймворк**: Quasar Framework 2.x
 - **Управление состоянием**: Pinia 2.x
@@ -256,7 +311,7 @@ SalePrice {
 - **Service Worker**: Workbox 7.x (через Quasar PWA plugin)
 - **Утилиты**: date-fns (работа с датами), lodash-es (утилиты)
 
-### 5.3. Инфраструктура и инструменты
+### 6.3. Инфраструктура и инструменты
 - **Сборка**: Vite 5.x (через Quasar)
 - **Контроль версий**: Git
 - **CI/CD**: GitHub Actions / GitLab CI
@@ -266,22 +321,13 @@ SalePrice {
 
 ---
 
-## 6. Синхронизация и офлайн‑режим
-
-* Все изменения фиксируются локально в RxDB
-* Изменения помечаются статусом `pending`
-* При появлении сети выполняется `push / pull`
-* Конфликты разрешаются по стратегии *last‑write‑wins* с уведомлением пользователя
-
----
-
 ## 7. Ключевые архитектурные принципы
 
-* Product — центральная сущность
-* TechCard вторична и существует только для производимых товаров
-* Сырьё и товары — разные домены
-* Все цены версионируются во времени
-* Себестоимость и цена продажи не пересчитываются «задним числом»
+* **Product — центральная сущность**
+* **TechCard вторична** и существует только для производимых товаров (связь 1:1)
+* **Сырьё и товары — разные домены**
+* **Все цены версионируются во времени** через единую сущность `PriceRecord`
+* **Себестоимость и цена продажи не пересчитываются «задним числом»** — новые расчёты создаются с новой датой
 
 ---
 
@@ -289,22 +335,25 @@ SalePrice {
 
 Модель поддерживает:
 
-* несколько точек продаж;
-* разные цены закупки;
-* расширение ассортимента;
-* аналитику маржи по категориям;
-* внедрение комплектов и комбо‑товаров.
+* Несколько точек продаж (через добавление поля `locationId` к ключевым сущностям).
+* Сложные модели ценообразования (через `metadata` в `PriceRecord`).
+* Расширение ассортимента (иерархия категорий).
+* Аналитику маржи по категориям, товарам, периодам.
+* Внедрение комплектов и комбо‑товаров (как новый тип `Product` с виртуальной `TechCard`).
+
+---
 
 ## 9. Конфигурационные файлы
 
 ### 9.1. Docker Compose (разработка)
+
 ```yaml
 version: '3.8'
 services:
   postgres:
     image: postgres:15-alpine
     environment:
-      POSTGRES_DB: techcards_dev
+      POSTGRES_DB: dinotech_dev
       POSTGRES_USER: devuser
       POSTGRES_PASSWORD: devpass
     ports:
@@ -317,7 +366,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      DATABASE_URL: "postgresql://devuser:devpass@postgres:5432/techcards_dev"
+      DATABASE_URL: "postgresql://devuser:devpass@postgres:5432/dinotech_dev"
       JWT_SECRET: "development-secret-change-in-production"
     depends_on:
       - postgres
@@ -329,7 +378,8 @@ volumes:
   postgres_data:
 ```
 
-### 9.2. Prisma Schema (пример)
+### 9.2. Prisma Schema (основные сущности)
+
 ```prisma
 generator client {
   provider = "prisma-client-js"
@@ -340,60 +390,135 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model TechCard {
-  id          String    @id @default(uuid())
+model Product {
+  id          String   @id @default(uuid())
   name        String
-  description String?
-  output      Float
-  ingredients Json      // JSONB массив ингредиентов
-  steps       Json?     // JSONB этапов производства
-  isActive    Boolean   @default(true)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  version     Int       @default(1)
+  sku         String?  @unique
+  type        ProductType // MANUFACTURED, RESALE
+  isActive    Boolean  @default(true)
 
-  calculations CostCalculation[]
-  user         User              @relation(fields: [userId], references: [id])
-  userId       String
+  categoryId  String?
+  category    Category? @relation(fields: [categoryId], references: [id])
 
-  @@index([userId])
-  @@index([createdAt])
+  // Связи
+  techCard    TechCard?                // Только для type=MANUFACTURED
+  costCalculations CostCalculation[]
+  priceRecords     PriceRecord[]       // Цены продажи (SALE_PRODUCT)
+
+  @@index([categoryId])
+  @@index([type])
+}
+
+model Category {
+  id       String   @id @default(uuid())
+  name     String
+  parentId String?
+  parent   Category? @relation("CategoryToCategory", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryToCategory")
+  products Product[]
+}
+
+model RawMaterial {
+  id        String   @id @default(uuid())
+  name      String
+  baseUnit  UnitType // G, ML, PCS
+
+  // Связи
+  ingredients TechCardIngredient[]
+  priceRecords PriceRecord[]        // Цены закупки (RAW_MATERIAL)
+}
+
+model TechCard {
+  id             String   @id @default(uuid())
+  version        Int      @default(1)
+  outputQuantity Float
+  outputUnit     UnitType
+
+  // Связь 1:1 с производимым товаром
+  productId      String   @unique
+  product        Product  @relation(fields: [productId], references: [id])
+
+  ingredients    TechCardIngredient[]
+
+  @@index([productId])
+}
+
+model TechCardIngredient {
+  id            String      @id @default(uuid())
+  quantity      Float
+  unit          UnitType
+  wasteFactor   Float       @default(1.0)
+
+  techCardId    String
+  techCard      TechCard    @relation(fields: [techCardId], references: [id], onDelete: Cascade)
+
+  rawMaterialId String
+  rawMaterial   RawMaterial @relation(fields: [rawMaterialId], references: [id])
+
+  @@index([techCardId])
+  @@index([rawMaterialId])
+}
+
+model PriceRecord {
+  id         String      @id @default(uuid())
+  entityType EntityType  // RAW_MATERIAL, RESALE_PRODUCT, SALE_PRODUCT
+  entityId   String      // ID сырья или товара
+  price      Float
+  currency   String      @default("RUB")
+  unit       UnitType?
+  validFrom  DateTime
+  metadata   Json?       // Для SALE_PRODUCT: { pricingModel, markupPercent, ... }
+
+  // Связи (необязательно, для валидации)
+  product      Product?      @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  rawMaterial  RawMaterial?  @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@index([entityType, entityId, validFrom])
 }
 
 model CostCalculation {
-  id         String    @id @default(uuid())
-  techCard   TechCard  @relation(fields: [techCardId], references: [id])
-  techCardId String
-  date       DateTime  @default(now())
-  costs      Json      // JSONB структура затрат
-  totalCost  Float
-  isCurrent  Boolean   @default(false)
+  id           String    @id @default(uuid())
+  productId    String
+  product      Product   @relation(fields: [productId], references: [id])
+  calculatedAt DateTime  @default(now())
+  totalCost    Float
+  source       CalculationSource // TECH_CARD, PURCHASE_PRICE
+  breakdown    Json      // Детализация расчёта
 
-  @@unique([techCardId, isCurrent])
-  @@index([date])
+  @@index([productId])
+  @@index([calculatedAt])
+}
+
+// Типы
+enum ProductType {
+  MANUFACTURED
+  RESALE
+}
+
+enum UnitType {
+  G
+  ML
+  PCS
+}
+
+enum EntityType {
+  RAW_MATERIAL
+  RESALE_PRODUCT
+  SALE_PRODUCT
+}
+
+enum CalculationSource {
+  TECH_CARD
+  PURCHASE_PRICE
 }
 ```
 
-## 10. Процесс синхронизации
+---
 
-### 10.1. Алгоритм синхронизации
-1. **Инициализация**: При запуске PWA проверяется соединение
-2. **Локальная работа**: Все изменения пишутся в RxDB с меткой `syncStatus: 'pending'`
-3. **Фоновая синхронизация**: При появлении сети Service Worker запускает синхронизацию
-4. **Разрешение конфликтов**: При конфликтах используется стратегия "последний пишет" с уведомлением пользователя
-5. **Подтверждение**: После успешной синхронизации статус изменяется на `synced`
+## 10. Развёртывание
 
-### 10.2. API эндпоинты для синхронизации
-```
-POST   /api/sync/push     - Отправка локальных изменений
-POST   /api/sync/pull     - Получение изменений с сервера
-GET    /api/sync/status   - Статус синхронизации
-POST   /api/sync/resolve  - Разрешение конфликтов
-```
+### 10.1. Локальная разработка
 
-## 11. Развёртывание
-
-### 11.1. Локальная разработка
 ```bash
 # Запуск базы данных
 docker-compose up -d postgres
@@ -410,12 +535,13 @@ npm install
 quasar dev -m pwa
 ```
 
-### 11.2. Продакшен сборка
+### 10.2. Продакшен сборка
+
 ```bash
 # Backend
 cd backend
 npm run build
-docker build -t tech-cards-backend .
+docker build -t dinotech-backend .
 
 # Frontend
 cd frontend
@@ -423,14 +549,18 @@ quasar build -m pwa
 # Результат в dist/pwa
 ```
 
-## 12. Мониторинг и логирование
+---
 
-### 12.1. Backend
+## 11. Мониторинг и логирование
+
+### 11.1. Backend
 - Логирование через Winston или NestJS встроенный логгер
 - Мониторинг здоровья эндпоинтов `/health`
-- Метрики производительности
+- Метрики производительности (количество расчётов, время ответа API)
 
-### 12.2. Frontend
+### 11.2. Frontend
 - Логирование офлайн-действий в IndexedDB
 - Отправка ошибок в Sentry (при наличии сети)
-- Мониторинг состояния синхронизации
+- Мониторинг состояния синхронизации и размера локальной БД
+
+---
