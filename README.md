@@ -23,6 +23,8 @@ Good dinosaurs code, great dinosaurs vibecode.
 
 Она фиксирует управленческие факты и поддерживает принятие решений.
 
+Система поддерживает историю зафиксированных расчётов, но не поддерживает реконструкцию состояния на произвольную дату. Это осознанное ограничение в пользу простоты и оперативности.
+
 ---
 
 ## 1. Ключевые сценарии использования
@@ -45,16 +47,17 @@ Good dinosaurs code, great dinosaurs vibecode.
 
 ---
 
-### Сценарий B. Приёмка поставки сырья или resale-товара
+### Сценарий B. Приёмка поставки ингредиентов или resale-товара
 
-1. Пользователь получает накладную (номер и дата сохраняются как текстовые атрибуты).
+1. Пользователь получает накладную (номер сохраняется как текстовый атрибут, дата сохраняется как дата).
 2. Вводит цену поставки:
 
-   * цену за упаковку поставки;
-   * количество или объём в упаковке.
-3. Система нормализует цену к базовой единице хранения (`baseUnit`).
+   * цену за позицию в поставке;
+   * количество позиций и объём в упаковке.
+3. Система приводит цену к базовой единице хранения (`baseUnit`).
 4. Обновляется текущая цена соответствующей сущности.
 5. Создаётся **PriceRecord** как событие изменения цены.
+6. Система автоматически помечает все **CostCalculation**, которые использовали эту сущность, как `isOutdated = true`.
 
 Система не ведёт учёт партий и остатков.
 
@@ -62,10 +65,10 @@ Good dinosaurs code, great dinosaurs vibecode.
 
 ### Сценарий C. Изменение цены и анализ влияния
 
-1. Пользователь меняет цену сырья, упаковки или resale-товара.
+1. Пользователь меняет цену ингредиента, упаковки, или resale-товара.
 2. Система строит граф зависимостей:
 
-   * RawMaterial → TechCardIngredient → TechCard → Product;
+   * Ingredient → TechCardIngredient → TechCard → Product;
    * Packaging → ProductPackaging → Product.
 3. Для каждого затронутого продукта рассчитывается preview-себестоимость.
 4. Пользователь принимает решение о фиксации новых расчётов.
@@ -75,7 +78,7 @@ Good dinosaurs code, great dinosaurs vibecode.
 ### Сценарий D. Изменение упаковки без изменения рецепта
 
 1. Пользователь изменяет упаковку товара.
-2. TechCard не изменяется.
+2. **TechCard** не изменяется.
 3. Себестоимость пересчитывается с учётом новой упаковки.
 
 ---
@@ -86,6 +89,17 @@ Good dinosaurs code, great dinosaurs vibecode.
 2. Управляет товарами, ценами, техкартами и упаковкой.
 3. Выполняет расчёты локально.
 4. При появлении сети данные синхронизируются.
+
+---
+
+### Сценарий F. Замена сиропа в ассортименте
+
+1. Поставщик прекратил выпуск «Сиропа ванильного».
+2. Менеджер для сущности **Ingredient** ставит `isActive = false`.
+3. Система проверяет: сироп используется в активной **TechCard** для товара «Ванильный латте».
+4. Система блокирует деактивацию и показывает сообщение: «Невозможно деактивировать. Сырьё используется в: Ванильный латте. Сначала измените техкарту или деактивируйте этот товар».
+5. Менеджер создаёт новую версию техкарты для «Ванильного латте» с новым сиропом. После сохранения новая техкарта становится активной, старая — автоматически деактивируется.
+6. Теперь, когда старый сироп не используется ни в одной активной техкарте, менеджер может деактивировать **Ingredient**.
 
 ---
 
@@ -101,12 +115,12 @@ Good dinosaurs code, great dinosaurs vibecode.
 
 ### 2.2. Цена и история изменений
 
-* В системе всегда существует **текущая цена**.
+* В системе всегда существует **текущая цена** (**PriceRecord** с максимальным `changedAt` для пары (entityType, entityId)).
 * При изменении цены:
 
   * создаётся новый **PriceRecord**;
-  * предыдущая цена сохраняется как `oldPrice`;
-  * новая цена становится `currentPrice`.
+  * предыдущая цена сохраняется как `previousPrice`;
+  * новая цена становится `CurrentPrice`.
 
 **PriceRecord** — журнал изменений, а не источник истины.
 
@@ -116,10 +130,26 @@ Good dinosaurs code, great dinosaurs vibecode.
 
 Себестоимость товара считается устаревшей (`isOutdated = true`), если:
 
-* изменилась цена любого используемого сырья;
+* изменилась цена любого используемого ингредиента;
 * изменилась цена упаковки;
 * изменилась TechCard;
 * изменилась упаковка товара.
+
+---
+
+### 2.4. Правила деактивации (жизненный цикл сущностей)
+
+Неактивные сущности `isActive = false` исключаются из операционной деятельности, но сохраняются для исторической аналитики и целостности данных. `isActive` - это состояние, а не просто атрибут. Изменение этого состояния должно запускает бизнес-логику и имеет последствия, это свойство видимости и возможности использовать сущность в операциях, мягкое удаление.
+
+Привязка к неактивным сущностям:
+
+Создавать новые привязки (**TechCardIngredient**, **ProductPackaging**) к неактивным **Ingredient** или **Packaging** — нельзя.
+
+Существующие исторические привязки остаются валидными.
+
+Активная **TechCard**: У каждого **Product** типа `manufactured` может быть только одна **TechCard** с `isActive = true`. Создание новой активной техкарты автоматически деактивирует предыдущую.
+
+Деактивация с проверкой: При попытке деактивировать **Ingredient** или **Packaging** система должна проверить, не используется ли оно в связях с активными **TechCard** или **Product**. Если используется — запретить деактивацию и вывести список зависимостей.
 
 ---
 
@@ -155,17 +185,18 @@ Category {
   id
   name
   parentId?
+  isActive
 }
 ```
 
 ---
 
-### 3.3. RawMaterial
+### 3.3. Ingredient
 
-Сырьё, используемое в производстве.
+Ингредиенты, сырьё, используемое в производстве.
 
 ```ts
-RawMaterial {
+Ingredient {
   id
   name
   baseUnit        // g | ml | pcs
@@ -211,15 +242,15 @@ TechCard {
 
 ### 3.6. TechCardIngredient
 
-Связь TechCard и RawMaterial.
+Связь TechCard и Ingredient.
 
 ```ts
 TechCardIngredient {
   id
   techCardId
-  rawMaterialId
+  ingredientId
   quantity
-  unit            // g | ml | pcs
+  baseUnit            // g | ml | pcs
   wasteFactor?
 }
 ```
@@ -248,14 +279,20 @@ ProductPackaging {
 ```ts
 PriceRecord {
   id
-  entityType      // RAW_MATERIAL | PACKAGING | PRODUCT_RESALE | PRODUCT_SALE
+  entityType      // INGREDIENT | PACKAGING | PRODUCT_RESALE | PRODUCT_MANUFACTURED
   entityId
-  oldPrice
-  newPrice
+  previousPrice
+  currentPrice
   baseUnit
   metadata        // pricingModel, markupPercent, marginValue и др.
-  changedAt
+  changedAt       // Date of calculation
 }
+```
+
+```json
+{ "pricingModel": "MARKUP", "markupPercent": 250 }
+// или
+{ "pricingModel": "ABSOLUTE_MARGIN", "marginValue": 150 }
 ```
 
 ---
@@ -269,9 +306,44 @@ CostCalculation {
   id
   productId
   totalCost
-  calculatedAt
+  calculatedAt    // Date of calculation
   breakdown       // IngredientsCost, PackagingCost
   isOutdated
+}
+```
+
+Пример breakdown записи:
+```json
+{
+  "ingredients": [
+    {
+      "ingredientId": 123,
+      "name": "Кофейное зерно",
+      "unitPrice": 1.71,
+      "quantity": 17
+    },
+    {
+      "ingredientId": 234,
+      "name": "Молоко 3,2%",
+      "unitPrice": 0.09,
+      "quantity": 270
+    }
+  ],
+  "packaging": [
+    {
+      "packagingId": 345,
+      "name": "Стакан 300 мл",
+      "unitPrice": 3.85,
+      "quantity": 1
+    },
+    {
+      "packagingId": 456,
+      "name": "Крышка большая",
+      "unitPrice": 2.35,
+      "quantity": 1
+    }
+  ],
+  "totalCost": 58.6
 }
 ```
 
@@ -290,7 +362,7 @@ TotalCost = IngredientsCost + PackagingCost
 1. Получить активную TechCard.
 2. Для каждого TechCardIngredient:
 
-   * определить актуальную цену RawMaterial;
+   * определить актуальную цену Ingredient;
    * привести единицы измерения;
    * учесть wasteFactor.
 3. Сложить стоимость ингредиентов.
@@ -312,7 +384,7 @@ TotalCost = IngredientsCost + PackagingCost
 TotalCost = PurchasePrice
 ```
 
-Где PurchasePrice — текущая цена Product(resale), полученная через PriceRecord.
+Где PurchasePrice — текущая цена **Product** типа `resale`, полученная через **PriceRecord**.
 
 ---
 
@@ -326,7 +398,7 @@ PricingModel = MARKUP | ABSOLUTE_MARGIN
 
 Формулы:
 
-* MARKUP: `salePrice = totalCost × (1 + markupPercent)`
+* MARKUP: `salePrice = totalCost × (1 + markupPercent / 100)`
 * ABSOLUTE_MARGIN: `salePrice = totalCost + marginValue`
 
 Параметры хранятся в `PriceRecord.metadata`.
@@ -347,7 +419,7 @@ PricingModel = MARKUP | ABSOLUTE_MARGIN
 
 * ввод цен по накладным;
 * просмотр товаров, цен и себестоимости;
-* без доступа к рецептурам и ценообразованию.
+* просмотр технических карт и описания процесса.
 
 ---
 
@@ -364,7 +436,7 @@ PricingModel = MARKUP | ABSOLUTE_MARGIN
 
 * локальное хранилище (RxDB);
 * офлайн-режим;
-* синхронизация push/pull.
+* синхронизация push/pull. При синхронизации конфликтующие изменения (например, цену одного и того же Ingredient изменили на двух устройствах офлайн) разрешаются по принципу «последняя запись по времени changedAt побеждает». Пользователи получают уведомление о таком авторазрешении.
 
 Схемы хранения являются реализационной деталью и могут эволюционировать.
 
@@ -375,5 +447,5 @@ PricingModel = MARKUP | ABSOLUTE_MARGIN
 * Цена — событие, а не просто поле.
 * Себестоимость фиксируется и не пересчитывается задним числом.
 * Упаковка и рецептура — независимые домены.
-* RawMaterial и Product(resale) используют единый механизм цен.
+* Ingredient и Product(resale) используют единый механизм цен.
 * Система оптимизирована под мобильный оперативный учёт.
